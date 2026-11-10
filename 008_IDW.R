@@ -222,6 +222,26 @@ res_ca <- run_idw_analysis(
   remove_outliers = FALSE
 )
 
+
+res_ca_noout <- run_idw_analysis(
+  sp_name = "Crocodylus acutus",
+  data_path = "D:/PROGRAMAS/Dropbox/TESIS_JORGE/Datos Genéticos/Tabla_to_model.xlsx",
+  sdm_path = "D:/PROGRAMAS/Dropbox/TESIS_JORGE/ENMeval/Crocodylus_acutus/Crocodylus_acutus_Binario_P10.tif",
+  outdir = "D:/PROGRAMAS/Dropbox/TESIS_JORGE/test_macrogenetics/IDW_CA_NOOUT",
+  suffix = "_IDW",
+  remove_outliers = TRUE,
+  iqr_mult = 1.5
+)
+
+res_cm <- run_idw_analysis(
+  sp_name = "Crocodylus moreletii",
+  data_path = "D:/PROGRAMAS/Dropbox/TESIS_JORGE/Datos Genéticos/Tabla_to_model.xlsx",
+  sdm_path = "D:/PROGRAMAS/Dropbox/TESIS_JORGE/ENMeval/Crocodylus_moreletii/Crocodylus_moreletii_Binario_P10.tif",
+  outdir = "D:/PROGRAMAS/Dropbox/TESIS_JORGE/test_macrogenetics/IDW_CM",
+  suffix = "_IDW",
+  remove_outliers = F
+)
+
 # Opción B: Con remoción de outliers (Filtro IQR k = 1.5)
 res_cm_noout <- run_idw_analysis(
   sp_name = "Crocodylus moreletii",
