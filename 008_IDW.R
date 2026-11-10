@@ -1,6 +1,6 @@
 #' @title Spatial Interpolation, Cross-Validation, and Mapping of Genetic Diversity (Ho)
 #' @description Encapsulated function to process genetic data, aggregate by SDM cells, 
-#' optimize IDW power, evaluate via LOOCV, and generate high-resolution maps and GeoTiffs.
+#' optimize IDW power, evaluate via LOOCV, and generate high-resolution maps, GeoTiffs, and evaluation metrics CSV.
 #' @author Chrystian Sosa (Modified via AI collaborator)
 #' @date 2026-09-22
 
@@ -21,7 +21,9 @@ run_idw_analysis <- function(
     data_path,
     sdm_path,
     outdir,
-    suffix = "_IDW"
+    suffix = "_IDW",
+    remove_outliers = FALSE,
+    iqr_mult = 1.5
 ) {
   message(paste(">>> Starting IDW analysis for:", sp_name))
   
@@ -59,6 +61,36 @@ run_idw_analysis <- function(
   
   data_aggregated_sf <- sf::st_as_sf(data_aggregated, coords = c("lon", "lat"), crs = 4326, remove = FALSE)
   
+  # ---> FILTRADO DE OUTLIERS POR IQR <---
+  if (isTRUE(remove_outliers)) {
+    q   <- stats::quantile(data_aggregated_sf$Ho, c(0.25, 0.75), na.rm = TRUE)
+    iqr <- q[[2]] - q[[1]]
+    
+    if (iqr == 0) {
+      warning("IQR = 0: outlier filter skipped.")
+    } else {
+      lo     <- q[[1]] - iqr_mult * iqr
+      hi     <- q[[2]] + iqr_mult * iqr
+      is_out <- data_aggregated_sf$Ho < lo | data_aggregated_sf$Ho > hi
+      
+      message(sprintf("IQR filter (k = %s): removing %d of %d cells (Ho outside [%.3f, %.3f])",
+                      iqr_mult, sum(is_out), length(is_out), lo, hi))
+      
+      if (any(is_out)) {
+        write.csv(sf::st_drop_geometry(data_aggregated_sf[is_out, ]),
+                  file.path(outdir, paste0(sp_name, "_Ho_outliers_removed.csv")),
+                  row.names = FALSE)
+      }
+      data_aggregated_sf <- data_aggregated_sf[!is_out, ]
+      data_aggregated    <- data_aggregated[!is_out, ]
+    }
+  }
+  
+  # Adjust suffix automatically if outliers are removed
+  if (isTRUE(remove_outliers)) {
+    suffix <- paste0(suffix, "_NOOUT")
+  }
+  
   # Prepare Spatial Objects and Window
   points_vect <- terra::vect(data_aggregated_sf)
   coords <- terra::crds(points_vect)
@@ -77,7 +109,7 @@ run_idw_analysis <- function(
   mse_result <- NULL
   
   for(power in powers){
-    CV_idw <- spatstat.explore::idw(ppp_obj, power = power, at = "points",leaveoneout=T)
+    CV_idw <- spatstat.explore::idw(ppp_obj, power = power, at = "points", leaveoneout = TRUE)
     mse_result <- c(mse_result, Metrics::mse(ppp_obj$marks, CV_idw))
   }
   
@@ -87,16 +119,19 @@ run_idw_analysis <- function(
   cv_preds <- spatstat.explore::idw(ppp_obj, power = optimal_power, 
                                     at = "pixels", leaveoneout = TRUE)
   rmse_val <- Metrics::rmse(ppp_obj$marks, as.numeric(cv_preds))
+  mae_val  <- Metrics::mae(ppp_obj$marks, as.numeric(cv_preds))
   
   # Print key metrics directly to console
   message(sprintf("--- Results for %s ---", sp_name))
   message(sprintf("Optimal Power: %.4f", optimal_power))
   message(sprintf("LOOCV RMSE:    %.4f", rmse_val))
   
-  # Performance Plot
-  train_preds <- as.numeric(spatstat.explore::idw(ppp_obj, power = optimal_power, at = "points", leaveoneout = T))
+  # Performance Plot & Calculation of R2
+  train_preds <- as.numeric(spatstat.explore::idw(ppp_obj, power = optimal_power, at = "points", leaveoneout = TRUE))
   train_df <- data.frame(Observed = ppp_obj$marks, Predicted = train_preds)
   n_samples <- nrow(data_aggregated)
+  
+  r2_val <- summary(lm(Predicted ~ Observed, data = train_df))$r.squared
   
   file_to_save_plot <- file.path(outdir, paste0(sp_name, "_IDW_Performance_CELLS", suffix, ".png"))
   
@@ -113,6 +148,24 @@ run_idw_analysis <- function(
     theme_bw(13)
   
   ggsave(file_to_save_plot, p_train, width = 8, height = 5.5, dpi = 600)
+  
+  # Compilar data frame de métricas
+  metrics_df <- data.frame(
+    species = sp_name,
+    n_cells = n_samples,
+    optimal_power = optimal_power,
+    loocv_rmse = rmse_val,
+    loocv_mae = mae_val,
+    r2 = r2_val,
+    remove_outliers = remove_outliers,
+    iqr_mult = if(remove_outliers) iqr_mult else NA,
+    date_processed = Sys.Date()
+  )
+  
+  # Guardar métricas en archivo CSV
+  csv_output_path <- file.path(outdir, paste0(sp_name, "_IDW_Metrics", suffix, ".csv"))
+  write.csv(metrics_df, csv_output_path, row.names = FALSE)
+  message(paste(">>> Saved metrics CSV to:", csv_output_path))
   
   # Generate Final Raster Output
   idw_raster <- terra::rast(
@@ -153,21 +206,29 @@ run_idw_analysis <- function(
   # Save Workspace Environment
   save.image(file_to_save_rdata)
   message(paste(">>> Successfully completed analysis for:", sp_name))
+  
+  return(metrics_df)
 }
 
-# 3. Example Execution ----------------------------------------------------
-run_idw_analysis(
+# 3. Ejemplos de Ejecución ------------------------------------------------
+
+# Opción A: Sin remoción de outliers (comportamiento por defecto)
+res_ca <- run_idw_analysis(
   sp_name = "Crocodylus acutus",
   data_path = "D:/PROGRAMAS/Dropbox/TESIS_JORGE/Datos Genéticos/Tabla_to_model.xlsx",
   sdm_path = "D:/PROGRAMAS/Dropbox/TESIS_JORGE/ENMeval/Crocodylus_acutus/Crocodylus_acutus_Binario_P10.tif",
   outdir = "D:/PROGRAMAS/Dropbox/TESIS_JORGE/test_macrogenetics/IDW_CA",
-  suffix = "_IDW"
+  suffix = "_IDW",
+  remove_outliers = FALSE
 )
 
-run_idw_analysis(
+# Opción B: Con remoción de outliers (Filtro IQR k = 1.5)
+res_cm_noout <- run_idw_analysis(
   sp_name = "Crocodylus moreletii",
   data_path = "D:/PROGRAMAS/Dropbox/TESIS_JORGE/Datos Genéticos/Tabla_to_model.xlsx",
   sdm_path = "D:/PROGRAMAS/Dropbox/TESIS_JORGE/ENMeval/Crocodylus_moreletii/Crocodylus_moreletii_Binario_P10.tif",
-  outdir = "D:/PROGRAMAS/Dropbox/TESIS_JORGE/test_macrogenetics/IDW_CM",
-  suffix = "_IDW"
+  outdir = "D:/PROGRAMAS/Dropbox/TESIS_JORGE/test_macrogenetics/IDW_CM_NOOUT",
+  suffix = "_IDW",
+  remove_outliers = TRUE,
+  iqr_mult = 1.5
 )
