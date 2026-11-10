@@ -12,8 +12,10 @@
 #' @param cor_cutoff \code{numeric}. Abs. Pearson threshold (only if decorr_method = "cor"). Default \code{0.5}.
 #' @param addLonLat \code{logical}. Retain lon/lat as predictors. Default \code{FALSE}.
 #' @param use_loocv \code{logical}. LOOCV (ignored if \code{use_blockcv = TRUE}). Default \code{FALSE}.
-#' @param use_blockcv \code{logical}. Spatial block CV (needs >= 50 points). Default \code{FALSE}.
+#' @param use_blockcv \code{logical}. Spatial block CV (needs >= 49 points). Default \code{FALSE}.
 #' @param kernel_type \code{character}. \code{"svmRadial"} or \code{"svmLinear"}.
+#' @param remove_outliers \code{logical}. Remove Ho outliers (IQR rule, cell level). Default \code{FALSE}.
+#' @param iqr_mult \code{numeric}. IQR multiplier for the fences. Default \code{1.5}.
 #'
 #' @return Invisibly returns \code{NULL}.
 #' @export
@@ -48,8 +50,14 @@ svr_ho_pipeline <- function(outdir,
                             addLonLat     = FALSE,
                             use_loocv     = FALSE,
                             use_blockcv   = FALSE,
+                            remove_outliers = FALSE,
+                            iqr_mult      = 1.5,
                             kernel_type   = "svmRadial") {
   
+  set.seed(123)
+  
+  
+
   decorr_method <- match.arg(decorr_method)
   dir.create(outdir, showWarnings = FALSE, recursive = TRUE)
   
@@ -111,6 +119,31 @@ svr_ho_pipeline <- function(outdir,
       .groups = "drop"
     )
   
+  
+  if (isTRUE(remove_outliers)) {
+    q   <- stats::quantile(data_aggregated_sf$Ho, c(0.25, 0.75), na.rm = TRUE)
+    iqr <- q[[2]] - q[[1]]
+    
+    if (iqr == 0) {
+      warning("IQR = 0: outlier filter skipped.")
+    } else {
+      lo     <- q[[1]] - iqr_mult * iqr
+      hi     <- q[[2]] + iqr_mult * iqr
+      is_out <- data_aggregated_sf$Ho < lo | data_aggregated_sf$Ho > hi
+      
+      message(sprintf("IQR filter (k = %s): removing %d of %d cells (Ho outside [%.3f, %.3f])",
+                      iqr_mult, sum(is_out), length(is_out), lo, hi))
+      
+      if (any(is_out)) {
+        write.csv(sf::st_drop_geometry(data_aggregated_sf[is_out, ]),
+                  file.path(outdir, paste0(sp_name, "_Ho_outliers_removed.csv")),
+                  row.names = FALSE)
+      }
+      data_aggregated_sf <- data_aggregated_sf[!is_out, ]
+    }
+  }
+  
+  
   message("Modelling with ", nrow(data_aggregated_sf), " aggregated grid cells.")
   
   bios_focal <- terra::focal(bios, w = 15, fun = mean, na.policy = "only", na.rm = TRUE)
@@ -136,9 +169,9 @@ svr_ho_pipeline <- function(outdir,
   data_aggregated_sp <- cbind(data_aggregated_sf, ext_direct_clean)
   rm(ext_direct_clean); gc()
   
-  if (nrow(data_aggregated_sp) > 50) {
-    message("more than 50 occurrences are available, performing spatial thin at 5 km")
-    data_aggregated_sp <- terra::thin(terra::vect(data_aggregated_sp), 5000)
+  if (nrow(data_aggregated_sp) > 49) {
+    message("more than 49 occurrences are available, performing spatial thin at 3 km")
+    data_aggregated_sp <- terra::thin(terra::vect(data_aggregated_sp), 3000)
     data_aggregated_sp <- sf::st_as_sf(data_aggregated_sp)
   }
   
@@ -196,8 +229,8 @@ svr_ho_pipeline <- function(outdir,
   applied_blockcv <- FALSE
   
   if (isTRUE(use_blockcv)) {
-    if (n_samples >= 50) {
-      message(sprintf("Validation scheme: Spatial Block CV (blockCV) [n = %d >= 50]", n_samples))
+    if (n_samples >= 49) {
+      message(sprintf("Validation scheme: Spatial Block CV (blockCV) [n = %d >= 49]", n_samples))
       
       data_sf_model <- data_aggregated_sp[valid_rows, ]
       
@@ -312,11 +345,13 @@ svr_ho_pipeline <- function(outdir,
     kernel_type       = kernel_type,
     add_lon_lat       = addLonLat,
     decorr_method     = decorr_method,
-    n_predictors      = length(predictors_list)
+    n_predictors      = length(predictors_list),
+    remove_outliers   = remove_outliers
   )
   
   suffix <- paste0("_", kernel_type, "_", val_scheme_str, "_", toupper(decorr_method),
-                   if (addLonLat) "_LONLAT" else "")
+                   if (addLonLat) "_LONLAT" else "",
+                   if (isTRUE(remove_outliers)) "_NOOUT" else "")
   
   write.csv(metrics_out,
             file.path(outdir, paste0(sp_name, "_SVM_Metrics_CELLS", suffix, ".csv")),
@@ -393,6 +428,14 @@ svr_ho_pipeline <- function(outdir,
   names(pred_raster) <- "Predicted_Ho"
   pred_raster[temp_dt$cell_idx] <- temp_dt$prediction
   
+  
+  terra::writeRaster(
+    pred_raster,
+    file.path(outdir, paste0(sp_name, "_Ho_Map_SVM_CELLS_RAW", suffix, ".tif")),
+    overwrite = TRUE
+  )
+  
+  
   # ------------------------------------------------------------------------------
   # 8. MESS MASKING
   # ------------------------------------------------------------------------------
@@ -417,6 +460,31 @@ svr_ho_pipeline <- function(outdir,
   # ------------------------------------------------------------------------------
   # 9. MAP EXPORT & WORKSPACE SAVING
   # ------------------------------------------------------------------------------
+  
+  ##raw
+  data("World", package = "tmap")
+  
+  map_out <- tm_shape(pred_raster) +
+    tm_raster(
+      col.legend = tm_legend(title = "Ho"),
+      palette = RColorBrewer::brewer.pal(7, "YlGnBu")
+    ) +
+    tm_shape(World) +
+    tm_borders(col = "grey40") +
+    tm_shape(my_sf_object) +
+    tm_symbols(col = "grey20", size = 0.15, alpha = 0.6) +
+    tm_shape(data_aggregated_sf) +
+    tm_symbols(col = "red", size = 0.35, shape = 21, border.col = "black", border.lwd = 0.5) +
+    tm_graticules(labels.size = 0.7) +
+    tm_layout(inner.margins = 0, legend.outside = TRUE, legend.outside.position = "right")
+  
+  tmap::tmap_save(
+    tm       = map_out,
+    filename = file.path(outdir, paste0(sp_name, "_Ho_Map_SVM_CELLS_RAW", suffix, ".pdf")),
+    width = 25, height = 15, units = "cm", dpi = 600
+  )
+  
+  #mess
   data("World", package = "tmap")
   
   map_out <- tm_shape(pred_raster_no_interpolated) +
@@ -453,7 +521,8 @@ n_cores       <- 6L      # nucleos fijos (modificable aqui)
 decorr_method <- "vif"   # "vif" (VIF < vif_th) o "cor" (|r| < cor_cutoff)
 vif_th        <- 10
 cor_cutoff    <- 0.5
-
+remove_outliers <- TRUE   # filtro IQR sobre Ho de celdas
+iqr_mult        <- 1.5
 out_dir  <- "D:/PROGRAMAS/Dropbox/TESIS_JORGE/test_macrogenetics"
 r_dir    <- "D:/test_layers_30s"
 
@@ -469,9 +538,8 @@ species_info <- list(
 )
 
 cv_configs <- list(
-  LOOCV   = list(use_loocv = TRUE,  use_blockcv = FALSE) #,
-  # BLOCKCV = list(use_loocv = FALSE, use_blockcv = TRUE),
-  # KFOLD   = list(use_loocv = FALSE, use_blockcv = FALSE)
+  LOOCV   = list(use_loocv = TRUE,  use_blockcv = FALSE),
+  BLOCKCV = list(use_loocv = FALSE, use_blockcv = TRUE)
 )
 
 # ==============================================================================
@@ -480,10 +548,12 @@ cv_configs <- list(
 scenarios_grid <- expand.grid(
   sp_code          = c("CA", "CM"),
   addLonLat        = c(TRUE, FALSE),
-  cv_type          = c("LOOCV"), #, "BLOCKCV", "KFOLD"),
+  cv_type          = c("LOOCV","BLOCKCV"), #, "BLOCKCV", "KFOLD"),
   stringsAsFactors = FALSE
 )
 
+
+scenarios_grid <- scenarios_grid[-c(5,7),]
 cat("Total de escenarios a ejecutar:", nrow(scenarios_grid), "\n")
 
 # ==============================================================================
@@ -498,7 +568,8 @@ for (i in 1:nrow(scenarios_grid)) {
   cv_data <- cv_configs[[row$cv_type]]
   
   ll_tag      <- if (isTRUE(row$addLonLat)) "WITH_LONLAT" else "NO_LONLAT"
-  folder_name <- paste(row$sp_code, "CELLS", ll_tag, row$cv_type, toupper(decorr_method), sep = "_")
+  folder_name <- paste(row$sp_code, "CELLS", ll_tag, row$cv_type, toupper(decorr_method),
+                       if (remove_outliers) "NOOUT", sep = "_")
   outdir_path <- file.path(out_dir, folder_name)
   
   cat(sprintf("\n------------------------------------------------------------\n"))
@@ -518,9 +589,11 @@ for (i in 1:nrow(scenarios_grid)) {
     addLonLat     = row$addLonLat,
     use_blockcv   = cv_data$use_blockcv,
     use_loocv     = cv_data$use_loocv,
+    remove_outliers = remove_outliers,
+    iqr_mult      = iqr_mult,
     kernel_type   = "svmRadial"
   )
-  # raster::tmpFiles(current = TRUE, orphan = TRUE, old = TRUE, remove = TRUE)
+terra::tmpFiles(current = TRUE, orphan = TRUE, old = TRUE, remove = TRUE)
 }
 
 cat("\n¡Procesamiento finalizado exitosamente para todos los escenarios!\n")
