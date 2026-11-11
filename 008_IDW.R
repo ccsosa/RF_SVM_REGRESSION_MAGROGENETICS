@@ -1,13 +1,14 @@
 #' @title Spatial Interpolation, Cross-Validation, and Mapping of Genetic Diversity (Ho)
-#' @description Encapsulated function to process genetic data, aggregate by SDM cells, 
-#' optimize IDW power, evaluate via LOOCV, and generate high-resolution maps, GeoTiffs, and evaluation metrics CSV.
+#' @description Process genetic data, aggregate by SDM cells, optionally apply spatial thinning,
+#' optimize IDW power, evaluate via LOOCV, and generate high-resolution maps across scenarios.
 #' @author Chrystian Sosa (Modified via AI collaborator)
-#' @date 2026-09-22
+#' @date 2026-11-10
 
 # 1. Load Required Libraries ----------------------------------------------
 library(dplyr)
 library(terra)
 library(spatstat)
+library(spatstat.explore)
 library(sf)
 library(readxl)
 library(Metrics)
@@ -23,9 +24,24 @@ run_idw_analysis <- function(
     outdir,
     suffix = "_IDW",
     remove_outliers = FALSE,
-    iqr_mult = 1.5
+    iqr_mult = 1.5,
+    thinning = FALSE,
+    thin_dist_km = 0
 ) {
   message(paste(">>> Starting IDW analysis for:", sp_name))
+  
+  # Adjust suffix automatically based on scenario parameters
+  if (isTRUE(remove_outliers)) {
+    suffix <- paste0(suffix, "_NOOUT")
+  } else {
+    suffix <- paste0(suffix, "_OUT")
+  }
+  
+  if (isTRUE(thinning) && thin_dist_km > 0) {
+    suffix <- paste0(suffix, sprintf("_THIN%dkm", thin_dist_km))
+  } else {
+    suffix <- paste0(suffix, "_NOTHIN")
+  }
   
   # Create output directory if it doesn't exist
   if (!dir.exists(outdir)) dir.create(outdir, recursive = TRUE)
@@ -86,9 +102,37 @@ run_idw_analysis <- function(
     }
   }
   
-  # Adjust suffix automatically if outliers are removed
-  if (isTRUE(remove_outliers)) {
-    suffix <- paste0(suffix, "_NOOUT")
+  # ---> SPATIAL THINNING (DISTANCIA MÍNIMA) <---
+  if (isTRUE(thinning) && thin_dist_km > 0) {
+    message(sprintf(">>> Applying spatial thinning (min distance: %g km)...", thin_dist_km))
+    
+    lon_center <- mean(data_aggregated$lon, na.rm = TRUE)
+    lat_center <- mean(data_aggregated$lat, na.rm = TRUE)
+    utm_zone   <- floor((lon_center + 180) / 6) + 1
+    crs_utm    <- sprintf("+proj=utm +zone=%d +datum=WGS84 +units=m +no_defs", utm_zone)
+    
+    sf_utm <- sf::st_transform(data_aggregated_sf, crs = crs_utm)
+    dist_matrix <- sf::st_distance(sf_utm)
+    units(dist_matrix) <- "km"
+    
+    n_pts <- nrow(sf_utm)
+    keep <- rep(TRUE, n_pts)
+    
+    for (i in seq_len(n_pts)) {
+      if (keep[i]) {
+        too_close <- which(as.numeric(dist_matrix[i, ]) < thin_dist_km & seq_len(n_pts) > i)
+        keep[too_close] <- FALSE
+      }
+    }
+    
+    n_removed <- sum(!keep)
+    message(sprintf("Thinning result: retained %d of %d cells (removed %d cells within %g km)",
+                    sum(keep), n_pts, n_removed, thin_dist_km))
+    
+    data_aggregated_sf <- data_aggregated_sf[keep, ]
+    data_aggregated    <- data_aggregated[keep, ]
+  } else {
+    message(">>> Spatial thinning bypassed: using all aggregated cells (conceptually reference).")
   }
   
   # Prepare Spatial Objects and Window
@@ -102,13 +146,13 @@ run_idw_analysis <- function(
   )
   
   ppp_obj <- spatstat.geom::ppp(x = coords[, 1], y = coords[, 2], window = win)
-  marks(ppp_obj) <- data_aggregated$Ho
+  spatstat.geom::marks(ppp_obj) <- data_aggregated$Ho
   
   # Cross-Validation to Optimize IDW Power
   powers <- seq(0.001, 10, 0.01)
   mse_result <- NULL
   
-  for(power in powers){
+  for (power in powers) {
     CV_idw <- spatstat.explore::idw(ppp_obj, power = power, at = "points", leaveoneout = TRUE)
     mse_result <- c(mse_result, Metrics::mse(ppp_obj$marks, CV_idw))
   }
@@ -117,7 +161,7 @@ run_idw_analysis <- function(
   
   # Evaluation metrics (LOOCV predictions)
   cv_preds <- spatstat.explore::idw(ppp_obj, power = optimal_power, 
-                                    at = "pixels", leaveoneout = TRUE)
+                                    at = "points", leaveoneout = TRUE)
   rmse_val <- Metrics::rmse(ppp_obj$marks, as.numeric(cv_preds))
   mae_val  <- Metrics::mae(ppp_obj$marks, as.numeric(cv_preds))
   
@@ -127,7 +171,7 @@ run_idw_analysis <- function(
   message(sprintf("LOOCV RMSE:    %.4f", rmse_val))
   
   # Performance Plot & Calculation of R2
-  train_preds <- as.numeric(spatstat.explore::idw(ppp_obj, power = optimal_power, at = "points", leaveoneout = TRUE))
+  train_preds <- as.numeric(cv_preds)
   train_df <- data.frame(Observed = ppp_obj$marks, Predicted = train_preds)
   n_samples <- nrow(data_aggregated)
   
@@ -149,7 +193,7 @@ run_idw_analysis <- function(
   
   ggsave(file_to_save_plot, p_train, width = 8, height = 5.5, dpi = 600)
   
-  # Compilar data frame de métricas
+  # Metrics Data Frame
   metrics_df <- data.frame(
     species = sp_name,
     n_cells = n_samples,
@@ -158,14 +202,15 @@ run_idw_analysis <- function(
     loocv_mae = mae_val,
     r2 = r2_val,
     remove_outliers = remove_outliers,
-    iqr_mult = if(remove_outliers) iqr_mult else NA,
+    iqr_mult = if (remove_outliers) iqr_mult else NA,
+    thinning = thinning,
+    thin_dist_km = if (thinning) thin_dist_km else 0,
     date_processed = Sys.Date()
   )
   
-  # Guardar métricas en archivo CSV
+  # Save metrics CSV
   csv_output_path <- file.path(outdir, paste0(sp_name, "_IDW_Metrics", suffix, ".csv"))
   write.csv(metrics_df, csv_output_path, row.names = FALSE)
-  message(paste(">>> Saved metrics CSV to:", csv_output_path))
   
   # Generate Final Raster Output
   idw_raster <- terra::rast(
@@ -203,52 +248,77 @@ run_idw_analysis <- function(
   
   tmap::tmap_save(tm = map_out, filename = file_to_save_pdf, width = 25, height = 15, units = "cm", dpi = 600)
   
-  # Save Workspace Environment
+  # Save Workspace
   save.image(file_to_save_rdata)
   message(paste(">>> Successfully completed analysis for:", sp_name))
   
   return(metrics_df)
 }
 
-# 3. Ejemplos de Ejecución ------------------------------------------------
+# ==============================================================================
+# CONFIGURACIÓN GENERAL Y GRILLA DE ESCENARIOS IDW
+# ==============================================================================
+out_base_dir <- "D:/PROGRAMAS/Dropbox/TESIS_JORGE/test_macrogenetics"
+data_path    <- "D:/PROGRAMAS/Dropbox/TESIS_JORGE/Datos Genéticos/Tabla_to_model.xlsx"
+sdm_base     <- "D:/PROGRAMAS/Dropbox/TESIS_JORGE/ENMeval"
 
-# Opción A: Sin remoción de outliers (comportamiento por defecto)
-res_ca <- run_idw_analysis(
-  sp_name = "Crocodylus acutus",
-  data_path = "D:/PROGRAMAS/Dropbox/TESIS_JORGE/Datos Genéticos/Tabla_to_model.xlsx",
-  sdm_path = "D:/PROGRAMAS/Dropbox/TESIS_JORGE/ENMeval/Crocodylus_acutus/Crocodylus_acutus_Binario_P10.tif",
-  outdir = "D:/PROGRAMAS/Dropbox/TESIS_JORGE/test_macrogenetics/IDW_CA",
-  suffix = "_IDW",
-  remove_outliers = FALSE
+species_info <- list(
+  CA = list(
+    name = "Crocodylus acutus",
+    sdm  = file.path(sdm_base, "Crocodylus_acutus/Crocodylus_acutus_Binario_P10.tif")
+  ),
+  CM = list(
+    name = "Crocodylus moreletii",
+    sdm  = file.path(sdm_base, "Crocodylus_moreletii/Crocodylus_moreletii_Binario_P10.tif")
+  )
 )
 
-
-res_ca_noout <- run_idw_analysis(
-  sp_name = "Crocodylus acutus",
-  data_path = "D:/PROGRAMAS/Dropbox/TESIS_JORGE/Datos Genéticos/Tabla_to_model.xlsx",
-  sdm_path = "D:/PROGRAMAS/Dropbox/TESIS_JORGE/ENMeval/Crocodylus_acutus/Crocodylus_acutus_Binario_P10.tif",
-  outdir = "D:/PROGRAMAS/Dropbox/TESIS_JORGE/test_macrogenetics/IDW_CA_NOOUT",
-  suffix = "_IDW",
-  remove_outliers = TRUE,
-  iqr_mult = 1.5
+# Grilla de combinaciones a testear:
+# Incluye thin_dist_km = 0 para el escenario conceptualmente estándar (sin thinning).
+idw_scenarios <- expand.grid(
+  sp_code         = c("CA", "CM"),
+  remove_outliers = c(TRUE, FALSE),
+  thin_dist_km    = c(0, 3, 5, 10), # 0 = Sin thinning (Referencia conceptual)
+  stringsAsFactors = FALSE
 )
 
-res_cm <- run_idw_analysis(
-  sp_name = "Crocodylus moreletii",
-  data_path = "D:/PROGRAMAS/Dropbox/TESIS_JORGE/Datos Genéticos/Tabla_to_model.xlsx",
-  sdm_path = "D:/PROGRAMAS/Dropbox/TESIS_JORGE/ENMeval/Crocodylus_moreletii/Crocodylus_moreletii_Binario_P10.tif",
-  outdir = "D:/PROGRAMAS/Dropbox/TESIS_JORGE/test_macrogenetics/IDW_CM",
-  suffix = "_IDW",
-  remove_outliers = F
-)
+cat("Total de escenarios IDW a ejecutar:", nrow(idw_scenarios), "\n")
 
-# Opción B: Con remoción de outliers (Filtro IQR k = 1.5)
-res_cm_noout <- run_idw_analysis(
-  sp_name = "Crocodylus moreletii",
-  data_path = "D:/PROGRAMAS/Dropbox/TESIS_JORGE/Datos Genéticos/Tabla_to_model.xlsx",
-  sdm_path = "D:/PROGRAMAS/Dropbox/TESIS_JORGE/ENMeval/Crocodylus_moreletii/Crocodylus_moreletii_Binario_P10.tif",
-  outdir = "D:/PROGRAMAS/Dropbox/TESIS_JORGE/test_macrogenetics/IDW_CM_NOOUT",
-  suffix = "_IDW",
-  remove_outliers = TRUE,
-  iqr_mult = 1.5
-)
+# ==============================================================================
+# EJECUCIÓN AUTOMATIZADA
+# ==============================================================================
+all_idw_results <- list()
+
+for (i in seq_len(nrow(idw_scenarios))) {
+  row     <- idw_scenarios[i, ]
+  sp_data <- species_info[[row$sp_code]]
+  
+  out_tag <- if (row$remove_outliers) "NOOUT" else "OUT"
+  thin_tag <- if (row$thin_dist_km > 0) paste0("THIN", row$thin_dist_km, "KM") else "NOTHIN"
+  
+  folder_name <- paste("IDW", row$sp_code, thin_tag, out_tag, sep = "_")
+  outdir_path <- file.path(out_base_dir, folder_name)
+  
+  cat(sprintf("\n------------------------------------------------------------\n"))
+  cat(sprintf("[%d/%d] Ejecutando: %s\n", i, nrow(idw_scenarios), folder_name))
+  cat(sprintf("------------------------------------------------------------\n"))
+  
+  all_idw_results[[folder_name]] <- run_idw_analysis(
+    sp_name         = sp_data$name,
+    data_path       = data_path,
+    sdm_path        = sp_data$sdm,
+    outdir          = outdir_path,
+    remove_outliers = row$remove_outliers,
+    iqr_mult        = 1.5,
+    thinning        = (row$thin_dist_km > 0),
+    thin_dist_km    = row$thin_dist_km
+  )
+  
+  terra::tmpFiles(current = TRUE, orphan = TRUE, old = TRUE, remove = TRUE)
+}
+
+# Consolidar todas las métricas en un único data.frame descriptivo
+summary_idw_metrics <- bind_rows(all_idw_results)
+write.csv(summary_idw_metrics, file.path(out_base_dir, "IDW_All_Scenarios_Summary_Metrics.csv"), row.names = FALSE)
+
+cat("\n¡Procesamiento IDW finalizado exitosamente para todos los escenarios!\n")
