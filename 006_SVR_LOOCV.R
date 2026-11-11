@@ -166,12 +166,31 @@ svr_ho_pipeline <- function(outdir,
   data_aggregated_sp <- cbind(data_aggregated_sf, ext_direct_clean)
   rm(ext_direct_clean); gc()
   
+  # if (nrow(data_aggregated_sp) > 49) {
+  #   message(sprintf("More than 49 occurrences are available, performing spatial thin at %d m", thin_dist))
+  #   data_aggregated_sp <- terra::thin(terra::vect(data_aggregated_sp), thin_dist,unit="m")
+  #   data_aggregated_sp <- sf::st_as_sf(data_aggregated_sp)
+  # }
   if (nrow(data_aggregated_sp) > 49) {
-    message(sprintf("More than 49 occurrences are available, performing spatial thin at %d m", thin_dist))
-    data_aggregated_sp <- terra::thin(terra::vect(data_aggregated_sp), thin_dist)
-    data_aggregated_sp <- sf::st_as_sf(data_aggregated_sp)
+    message(sprintf("More than 49 cells available, terra::thin at %d m", thin_dist))
+    
+    xy  <- terra::xyFromCell(bios[[1]], data_aggregated_sp$cell_id)    # un punto por celda
+    pts <- terra::vect(xy, type = "points", crs = "EPSG:4326")
+    pts$cell_id <- data_aggregated_sp$cell_id
+    
+    kept <- terra::thin(pts, d = thin_dist)                            # d en metros
+    
+    data_aggregated_sp <- data_aggregated_sp[data_aggregated_sp$cell_id %in% kept$cell_id, ]
+    
+    D <- sf::st_distance(data_aggregated_sp)
+    D <- matrix(as.numeric(D), nrow = nrow(D), ncol = ncol(D))
+    diag(D) <- NA
+    
+    message(sprintf("Retained %d of %d cells | min. distance = %.1f km",
+                    nrow(kept), nrow(pts),
+                    min(D,na.rm = T)/1000)
+    )
   }
-  
   # ------------------------------------------------------------------------------
   # 3. FEATURE SELECTION & DECORRELATION
   # ------------------------------------------------------------------------------
@@ -179,12 +198,38 @@ svr_ho_pipeline <- function(outdir,
     dplyr::select(Ho, n_samples_in_cell, dplyr::all_of(names(bios))) %>%
     sf::st_drop_geometry()
   
+  
+  message(sprintf("Retained %d cells | min. distance = %.1f km",
+                  nrow(data_aggregated_sp),
+                  min(terra::distance(terra::vect(data_aggregated_sp))) / 1000))
+  
   valid_rows <- complete.cases(data_sel)
   data_sel   <- data_sel[valid_rows, ]
   n_samples  <- nrow(data_sel)
   
   bio_vars_only <- setdiff(names(bios), c("lon", "lat"))
   bio_df        <- as.data.frame(data_sel[, bio_vars_only])
+  
+
+  # Argumento de la función (modificable)
+  dom_max <- 0.3   # fracción máxima de celdas con el mismo valor
+  
+  bio_df <- as.data.frame(data_sel[, bio_vars_only])
+  
+  diag_var <- data.frame(
+    var      = names(bio_df),
+    dom_frac = sapply(bio_df, function(x) max(table(round(x, 6))) / length(x))
+  )
+  diag_var$drop <- diag_var$dom_frac > dom_max
+  
+  write.csv(diag_var, file.path(outdir, paste0(sp_name, "_dominance_screen.csv")),
+            row.names = FALSE)
+  message("Eliminadas por dominancia: (un valor en mas del ",dom_max*100,"%)",
+          paste(diag_var$var[diag_var$drop], collapse = ", "))
+  
+  bio_vars_only <- diag_var$var[!diag_var$drop]
+  bio_df        <- bio_df[, bio_vars_only, drop = FALSE]
+  # sigue vifstep(bio_df, th = vif_th)
   
   if (decorr_method == "vif") {
     message(sprintf("Decorrelation: VIF stepwise (th = %s)", vif_th))
@@ -284,8 +329,8 @@ svr_ho_pipeline <- function(outdir,
   
   if (kernel_type == "svmRadial") {
     svm_grid <- expand.grid(
-      sigma = c(0.0005, 0.001, 0.005, 0.01, 0.02, 0.05, 0.1, 0.5, 1),
-      C     = c(0.05, 0.1, 0.5, 1, 2, 5, 10, 20, 50, 100)
+      sigma = c(0.0005, 0.001, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2,0.5, 1),
+      C     = c(0.05, 0.1, 0.5, 1, 2, 5, 10, 20, 50, 100,500,1000)
     )
   } else {
     svm_grid <- expand.grid(C = 10^seq(-3, 2, length.out = 30))
@@ -476,8 +521,8 @@ svr_ho_pipeline <- function(outdir,
     tm_borders(col = "grey40") +
     tm_shape(my_sf_object) +
     tm_symbols(col = "grey20", size = 0.15, alpha = 0.6) +
-    tm_shape(data_aggregated_sf) +
-    tm_symbols(col = "red", size = 0.35, shape = 21, border.col = "black", border.lwd = 0.5) +
+    tm_shape(data_aggregated_sp) +
+    tm_symbols(col = "red", size = 0.15, shape = 21, border.col = "black", border.lwd = 0.5) +
     tm_graticules(labels.size = 0.7) +
     tm_layout(inner.margins = 0, legend.outside = TRUE, legend.outside.position = "right")
   
@@ -496,8 +541,8 @@ svr_ho_pipeline <- function(outdir,
     tm_borders(col = "grey40") +
     tm_shape(my_sf_object) +
     tm_symbols(col = "grey20", size = 0.15, alpha = 0.6) +
-    tm_shape(data_aggregated_sf) +
-    tm_symbols(col = "red", size = 0.35, shape = 21, border.col = "black", border.lwd = 0.5) +
+    tm_shape(data_aggregated_sp) +
+    tm_symbols(col = "red", size = 0.15, shape = 21, border.col = "black", border.lwd = 0.5) +
     tm_graticules(labels.size = 0.7) +
     tm_layout(inner.margins = 0, legend.outside = TRUE, legend.outside.position = "right")
   
@@ -523,7 +568,7 @@ vif_th          <- 10
 cor_cutoff      <- 0.5
 remove_outliers <- TRUE
 iqr_mult        <- 1.5
-thin_dist       <- 3000   
+thin_dist       <- 5000   
 
 out_dir  <- "D:/PROGRAMAS/Dropbox/TESIS_JORGE/test_macrogenetics"
 r_dir    <- "D:/test_layers_30s"
@@ -535,7 +580,7 @@ sdm_ca <- file.path(sdm_base, "Crocodylus_acutus/Crocodylus_acutus_Binario_P10.t
 sdm_cm <- file.path(sdm_base, "Crocodylus_moreletii/Crocodylus_moreletii_Binario_P10.tif")
 
 species_info <- list(
-  CA = list(name = "Crocodylus acutus",     sdm = sdm_ca),
+  # CA = list(name = "Crocodylus acutus",     sdm = sdm_ca),
   CM = list(name = "Crocodylus moreletii",  sdm = sdm_cm)
 )
 
@@ -548,10 +593,11 @@ cv_configs <- list(
 # GRILLA DE ESCENARIOS
 # ==============================================================================
 scenarios_grid <- expand.grid(
-  sp_code         = c("CA", "CM"),
+  sp_code         =  #c("CA",
+                      c("CM"),
   addLonLat        = c(TRUE, FALSE),
   cv_type          = c("LOOCV", "BLOCKCV"),
-  thin_dist        = c(2000, 3000, 5000, 10000, 15000, 20000),
+  thin_dist        = c(15000),
   stringsAsFactors = FALSE
 )
 
@@ -564,7 +610,7 @@ cat("Total de escenarios a ejecutar:", nrow(scenarios_grid), "\n")
 results <- list()
 
 for (i in 1:nrow(scenarios_grid)) {
-  
+# i <- 2  
   row     <- scenarios_grid[i, ]
   sp_data <- species_info[[row$sp_code]]
   cv_data <- cv_configs[[row$cv_type]]
