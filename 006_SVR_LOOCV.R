@@ -38,6 +38,9 @@ library(usdm)
 library(RColorBrewer)
 library(tmap)
 library(blockCV)
+#install.packages("fastshap", repos = c("https://bgreenwell.r-universe.dev", "https://cloud.r-project.org"))
+library(fastshap)
+library(ggplot2)
 
 svr_ho_pipeline <- function(outdir,
                             sp_name,
@@ -444,6 +447,60 @@ svr_ho_pipeline <- function(outdir,
     file.path(outdir, paste0(sp_name, "_SVM_Performance_CELLS", suffix, ".png")),
     p_train + p_test, width = 12, height = 5.5, dpi = 600
   )
+  
+  
+  # ------------------------------------------------------------------------------
+  # 6.1. EXPLAINABILITY WITH SHAP VALUES
+  # ------------------------------------------------------------------------------
+  message("Calculating SHAP values for the SVR model...")
+  
+  # 1. Define the predictive function adapted for fastshap
+  pfun <- function(object, newdata) {
+    predict(object, newdata = newdata)
+  }
+  
+  # 2. Calculate SHAP values
+  # Note: 'X' must contain only the predictor variables (excluding the response 'Ho')
+  set.seed(123)
+  shap_values <- fastshap::explain(
+    final_svr,
+    X            = data_sel_model[, predictors_list, drop = FALSE],
+    pred_wrapper = pfun,
+    nsim         = 50,         # Number of Monte Carlo iterations (increase if higher precision is needed)
+    parallel     = TRUE        # Leverages processing cores if an active cluster is available
+  )
+  
+  # 3. Save detailed cell-level SHAP values
+  shap_df <- as.data.frame(shap_values)
+  shap_df$cell_row <- 1:nrow(shap_df)
+  
+  write.csv(
+    shap_df,
+    file.path(outdir, paste0(sp_name, "_SHAP_Values_CELLS", suffix, ".csv")),
+    row.names = FALSE
+  )
+  
+  # 4. Global Importance Plot (Mean of absolute SHAP values)
+  p_shap_imp <- ggplot2::autoplot(shap_values, type = "importance") +
+    labs(
+      title    = "A) Global Importance (SHAP)",
+      subtitle = paste("SVR Model |", val_scheme_str),
+      x        = "Mean Absolute SHAP Value (Impact on Ho)",
+      y        = "Predictor"
+    ) +
+    theme_bw(13)
+  
+  ggsave(
+    file.path(outdir, paste0(sp_name, "_SHAP_Importance", suffix, ".png")),
+    p_shap_imp, width = 7, height = 6, dpi = 600
+  )
+  
+  # 5. Dependence / Global Effect Plot (Example for the most important or a specific variable)
+  # Shows how the value of the climatic variable affects the Ho prediction
+  # top_var <- names(sort(colMeans(abs(shap_values)), decreasing = TRUE))[1]
+  # p_dep <- fastshap::autoplot(shap_values, type = "dependence", feature = top_var, X = data_sel_model) +
+  #   theme_bw(13)
+  # ggsave(file.path(outdir, paste0(sp_name, "_SHAP_Dependence_", top_var, suffix, ".png")), p_dep, width = 6, height = 5, dpi = 300)
   
   # ------------------------------------------------------------------------------
   # 7. SPATIAL PREDICTION (RASTER)
