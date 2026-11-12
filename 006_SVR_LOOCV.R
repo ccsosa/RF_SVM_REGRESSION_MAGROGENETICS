@@ -1,26 +1,6 @@
-#' Spatial Prediction Workflow for Genetic Heterozygosity (Ho) using Support Vector Regression
-#' (solo celdas; decorrelacion por VIF o correlacion)
-#'
-#' @param outdir \code{character}. Output directory path.
-#' @param sp_name \code{character}. Exact target species name.
-#' @param raster_dir \code{character}. Directory with predictor rasters (.tif).
-#' @param data_path \code{character}. Excel file with genetic data.
-#' @param sdm_path \code{character}. Binary SDM raster.
-#' @param n_cores \code{integer}. Processing cores. Default \code{6L}.
-#' @param decorr_method \code{character}. \code{"vif"} (usdm::vifstep) or \code{"cor"} (caret::findCorrelation). Default \code{"vif"}.
-#' @param vif_th \code{numeric}. VIF threshold (only if decorr_method = "vif"). Default \code{10}.
-#' @param cor_cutoff \code{numeric}. Abs. Pearson threshold (only if decorr_method = "cor"). Default \code{0.5}.
-#' @param addLonLat \code{logical}. Retain lon/lat as predictors. Default \code{FALSE}.
-#' @param use_loocv \code{logical}. LOOCV (ignored if \code{use_blockcv = TRUE}). Default \code{FALSE}.
-#' @param use_blockcv \code{logical}. Spatial block CV (needs >= 49 points). Default \code{FALSE}.
-#' @param kernel_type \code{character}. \code{"svmRadial"} or \code{"svmLinear"}.
-#' @param remove_outliers \code{logical}. Remove Ho outliers (IQR rule, cell level). Default \code{FALSE}.
-#' @param iqr_mult \code{numeric}. IQR multiplier for the fences. Default \code{1.5}.
-#' @param thin_dist \code{numeric}. Minimum spatial thinning distance in meters. Default \code{3000}.
-#'
-#' @return Invisibly returns \code{NULL}.
-#' @export
-
+# ==============================================================================
+# DEPENDENCIES
+# ==============================================================================
 library(dplyr)
 library(readxl)
 library(sf)
@@ -38,26 +18,104 @@ library(usdm)
 library(RColorBrewer)
 library(tmap)
 library(blockCV)
-#install.packages("fastshap", repos = c("https://bgreenwell.r-universe.dev", "https://cloud.r-project.org"))
-library(fastshap)
-library(ggplot2)
+library(fastshap)   # Shapley values (>= 0.1.0: no plotting methods)
+library(shapviz)    # SHAP visualisation (beeswarm additionally needs ggbeeswarm)
 
+#' Spatial Prediction Workflow for Genetic Heterozygosity (Ho) using Support
+#' Vector Regression (cell level; VIF- or correlation-based decorrelation)
+#'
+#' @description
+#' Fits an SVR model (via \pkg{caret}) that relates observed heterozygosity (Ho)
+#' to environmental predictors at the raster-cell level, evaluates it with
+#' repeated k-fold CV, LOOCV or spatial block CV, explains it with SHAP values
+#' (\pkg{fastshap} + \pkg{shapviz}), and projects Ho over the species' binary
+#' SDM, masking non-analogue conditions with MESS.
+#'
+#' @details
+#' Workflow:
+#' \enumerate{
+#'   \item Load predictor rasters (must include layers named \code{lon} and
+#'         \code{lat}) and genetic records for \code{sp_name}
+#'         (sheet \code{"data"}; columns \code{sp}, \code{Ho}, \code{lon},
+#'         \code{lat}). Records with missing or zero Ho are dropped.
+#'   \item Assign each record to a raster cell (off-coverage points are snapped
+#'         to the nearest valid cell within 5 km) and aggregate per cell:
+#'         median Ho, MAD and number of samples. Optionally remove Ho outliers
+#'         with the IQR rule.
+#'   \item Extract predictor values per cell (coastal NAs are filled from a
+#'         focal-mean raster) and, if more than 49 cells are available, thin
+#'         cells spatially with \code{terra::thin()} at \code{thin_dist} m.
+#'   \item Drop predictors dominated by a single value (\code{dom_max}), then
+#'         decorrelate with VIF or Pearson correlation.
+#'   \item Train the SVR (cell weights = \code{sqrt(n_samples_in_cell)}; inputs
+#'         centred and scaled) over a tuning grid, minimising RMSE.
+#'   \item Compute train (resubstitution) and cross-validated metrics.
+#'   \item Compute SHAP values on the final model and export importance,
+#'         beeswarm and dependence plots.
+#'   \item Predict Ho over the SDM, mask extrapolation with MESS and export
+#'         rasters, maps (PDF) and the R workspace.
+#' }
+#'
+#' @param outdir \code{character}. Output directory path (created if missing).
+#' @param sp_name \code{character}. Exact target species name (matched against
+#'   column \code{sp}).
+#' @param raster_dir \code{character}. Directory with predictor rasters
+#'   (\code{.tif}); must contain layers named \code{lon} and \code{lat}.
+#' @param data_path \code{character}. Excel file with genetic data (sheet
+#'   \code{"data"}).
+#' @param sdm_path \code{character}. Binary SDM raster (1 = suitable, 0 = not).
+#' @param n_cores \code{integer}. Cores for model training. Default \code{6L}.
+#' @param decorr_method \code{character}. \code{"vif"} (\code{usdm::vifstep})
+#'   or \code{"cor"} (\code{caret::findCorrelation}). Default \code{"vif"}.
+#' @param vif_th \code{numeric}. VIF threshold (only if
+#'   \code{decorr_method = "vif"}). Default \code{10}.
+#' @param cor_cutoff \code{numeric}. Absolute Pearson correlation threshold
+#'   (only if \code{decorr_method = "cor"}). Default \code{0.5}.
+#' @param dom_max \code{numeric}. Maximum fraction of cells allowed to share the
+#'   same value of a predictor; predictors above it are dropped. Default
+#'   \code{0.3}.
+#' @param addLonLat \code{logical}. Retain \code{lon}/\code{lat} as predictors.
+#'   Default \code{FALSE}.
+#' @param use_loocv \code{logical}. Use leave-one-out CV (ignored if
+#'   \code{use_blockcv = TRUE}). Default \code{FALSE}; if both are
+#'   \code{FALSE}, 5-fold CV repeated 10 times is used.
+#' @param use_blockcv \code{logical}. Use spatial block CV (k = 4, via
+#'   \pkg{blockCV}); requires at least 49 cells, otherwise the scenario is
+#'   discarded, \code{outdir} is deleted and \code{NULL} is returned. Default
+#'   \code{FALSE}.
+#' @param remove_outliers \code{logical}. Remove Ho outliers at the cell level
+#'   (IQR rule); removed cells are written to a CSV. Default \code{FALSE}.
+#' @param iqr_mult \code{numeric}. IQR multiplier for the outlier fences.
+#'   Default \code{1.5}.
+#' @param kernel_type \code{character}. \code{"svmRadial"} or
+#'   \code{"svmLinear"}. Default \code{"svmRadial"}.
+#' @param thin_dist \code{numeric}. Minimum spatial thinning distance in
+#'   metres. Default \code{3000}.
+#'
+#' @return Invisibly returns \code{NULL}. Results are written to
+#'   \code{outdir}: data used for modelling, predictor list, dominance and VIF
+#'   tables, metrics and CV predictions (CSV), performance and SHAP plots (PNG),
+#'   SHAP values (CSV), raw and MESS-masked Ho rasters (GeoTIFF), maps (PDF) and
+#'   the R workspace (\code{.RData}).
+#'
+#' @export
 svr_ho_pipeline <- function(outdir,
                             sp_name,
                             raster_dir,
                             data_path,
                             sdm_path,
-                            n_cores       = 6L,
-                            decorr_method = c("vif"),
-                            vif_th        = 10,
-                            cor_cutoff    = 0.5,
-                            addLonLat     = FALSE,
-                            use_loocv     = FALSE,
-                            use_blockcv   = FALSE,
+                            n_cores         = 6L,
+                            decorr_method   = c("vif", "cor"),
+                            vif_th          = 10,
+                            cor_cutoff      = 0.5,
+                            dom_max         = 0.3,
+                            addLonLat       = FALSE,
+                            use_loocv       = FALSE,
+                            use_blockcv     = FALSE,
                             remove_outliers = FALSE,
-                            iqr_mult      = 1.5,
-                            kernel_type   = "svmRadial",
-                            thin_dist     = 3000) {
+                            iqr_mult        = 1.5,
+                            kernel_type     = "svmRadial",
+                            thin_dist       = 3000) {
   
   set.seed(123)
   
@@ -169,19 +227,14 @@ svr_ho_pipeline <- function(outdir,
   data_aggregated_sp <- cbind(data_aggregated_sf, ext_direct_clean)
   rm(ext_direct_clean); gc()
   
-  # if (nrow(data_aggregated_sp) > 49) {
-  #   message(sprintf("More than 49 occurrences are available, performing spatial thin at %d m", thin_dist))
-  #   data_aggregated_sp <- terra::thin(terra::vect(data_aggregated_sp), thin_dist,unit="m")
-  #   data_aggregated_sp <- sf::st_as_sf(data_aggregated_sp)
-  # }
   if (nrow(data_aggregated_sp) > 49) {
     message(sprintf("More than 49 cells available, terra::thin at %d m", thin_dist))
     
-    xy  <- terra::xyFromCell(bios[[1]], data_aggregated_sp$cell_id)    # un punto por celda
+    xy  <- terra::xyFromCell(bios[[1]], data_aggregated_sp$cell_id)    # one point per cell
     pts <- terra::vect(xy, type = "points", crs = "EPSG:4326")
     pts$cell_id <- data_aggregated_sp$cell_id
     
-    kept <- terra::thin(pts, d = thin_dist)                            # d en metros
+    kept <- terra::thin(pts, d = thin_dist)                            # d in metres
     
     data_aggregated_sp <- data_aggregated_sp[data_aggregated_sp$cell_id %in% kept$cell_id, ]
     
@@ -191,16 +244,16 @@ svr_ho_pipeline <- function(outdir,
     
     message(sprintf("Retained %d of %d cells | min. distance = %.1f km",
                     nrow(kept), nrow(pts),
-                    min(D,na.rm = T)/1000)
+                    min(D, na.rm = TRUE) / 1000)
     )
   }
+  
   # ------------------------------------------------------------------------------
   # 3. FEATURE SELECTION & DECORRELATION
   # ------------------------------------------------------------------------------
   data_sel <- data_aggregated_sp %>%
     dplyr::select(Ho, n_samples_in_cell, dplyr::all_of(names(bios))) %>%
     sf::st_drop_geometry()
-  
   
   message(sprintf("Retained %d cells | min. distance = %.1f km",
                   nrow(data_aggregated_sp),
@@ -213,12 +266,7 @@ svr_ho_pipeline <- function(outdir,
   bio_vars_only <- setdiff(names(bios), c("lon", "lat"))
   bio_df        <- as.data.frame(data_sel[, bio_vars_only])
   
-
-  # Argumento de la función (modificable)
-  dom_max <- 0.3   # fracción máxima de celdas con el mismo valor
-  
-  bio_df <- as.data.frame(data_sel[, bio_vars_only])
-  
+  # Dominance screen: drop predictors where one value covers > dom_max of cells
   diag_var <- data.frame(
     var      = names(bio_df),
     dom_frac = sapply(bio_df, function(x) max(table(round(x, 6))) / length(x))
@@ -227,16 +275,15 @@ svr_ho_pipeline <- function(outdir,
   
   write.csv(diag_var, file.path(outdir, paste0(sp_name, "_dominance_screen.csv")),
             row.names = FALSE)
-  message("Eliminadas por dominancia: (un valor en mas del ",dom_max*100,"%)",
+  message("Dropped by dominance (one value in more than ", dom_max * 100, "% of cells): ",
           paste(diag_var$var[diag_var$drop], collapse = ", "))
   
   bio_vars_only <- diag_var$var[!diag_var$drop]
   bio_df        <- bio_df[, bio_vars_only, drop = FALSE]
-  # sigue vifstep(bio_df, th = vif_th)
   
   if (decorr_method == "vif") {
     message(sprintf("Decorrelation: VIF stepwise (th = %s)", vif_th))
-    vif_res        <- usdm::vifstep(bio_df, th = vif_th)
+    vif_res       <- usdm::vifstep(bio_df, th = vif_th)
     selected_bios <- setdiff(bio_vars_only, vif_res@excluded)
     write.csv(
       as.data.frame(vif_res@results),
@@ -288,18 +335,18 @@ svr_ho_pipeline <- function(outdir,
       names(test_index)  <- names(train_index)
       
       train_ctrl <- caret::trainControl(
-        method              = "cv",
-        number              = length(train_index),
-        index               = train_index,
-        indexOut            = test_index,
+        method          = "cv",
+        number          = length(train_index),
+        index           = train_index,
+        indexOut        = test_index,
         savePredictions = "final",
-        allowParallel       = TRUE
+        allowParallel   = TRUE
       )
       applied_blockcv <- TRUE
       
     } else {
-      message(sprintf("[ESCENARIO DESCARTADO] 'use_blockcv = TRUE' solicitado, pero n = %d (< 50).", n_samples))
-      message("--> Eliminando carpeta vacía o incompleta y finalizando ejecución de este escenario...\n")
+      message(sprintf("[SCENARIO DISCARDED] 'use_blockcv = TRUE' requested, but n = %d (< 49).", n_samples))
+      message("--> Removing empty/incomplete output folder and ending this scenario...\n")
       
       if (dir.exists(outdir)) {
         unlink(outdir, recursive = TRUE)
@@ -322,7 +369,7 @@ svr_ho_pipeline <- function(outdir,
   val_scheme_str <- if (applied_blockcv) "BLOCKCV" else if (isTRUE(use_loocv)) "LOOCV" else "REPEATEDCV"
   
   # ------------------------------------------------------------------------------
-  # ENTRENAMIENTO SVM
+  # SVM TRAINING
   # ------------------------------------------------------------------------------
   cl <- makeCluster(n_cores)
   registerDoParallel(cl)
@@ -332,8 +379,8 @@ svr_ho_pipeline <- function(outdir,
   
   if (kernel_type == "svmRadial") {
     svm_grid <- expand.grid(
-      sigma = c(0.0005, 0.001, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2,0.5, 1),
-      C     = c(0.05, 0.1, 0.5, 1, 2, 5, 10, 20, 50, 100,500,1000)
+      sigma = c(0.0005, 0.001, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1),
+      C     = c(0.05, 0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 500, 1000)
     )
   } else {
     svm_grid <- expand.grid(C = 10^seq(-3, 2, length.out = 30))
@@ -341,13 +388,13 @@ svr_ho_pipeline <- function(outdir,
   
   final_svr <- caret::train(
     Ho ~ .,
-    data        = data_sel_model,
-    method      = kernel_type,
-    weights     = weights_vec,
+    data       = data_sel_model,
+    method     = kernel_type,
+    weights    = weights_vec,
     preProcess = c("center", "scale"),
-    trControl   = train_ctrl,
-    tuneGrid    = svm_grid,
-    metric      = "RMSE"
+    trControl  = train_ctrl,
+    tuneGrid   = svm_grid,
+    metric     = "RMSE"
   )
   
   stopCluster(cl)
@@ -387,16 +434,16 @@ svr_ho_pipeline <- function(outdir,
   test_rsq  <- yardstick::rsq_vec(cv_df$Observed, cv_df$Predicted)
   
   metrics_out <- data.frame(
-    .metric            = c("rmse", "mae", "rsq", "rmse", "mae", "rsq"),
-    mean                = c(test_rmse, test_mae, test_rsq, train_rmse, train_mae, train_rsq),
-    dataset             = c("validation_test", "validation_test", "validation_test", "train", "train", "train"),
+    .metric           = c("rmse", "mae", "rsq", "rmse", "mae", "rsq"),
+    mean              = c(test_rmse, test_mae, test_rsq, train_rmse, train_mae, train_rsq),
+    dataset           = c("validation_test", "validation_test", "validation_test", "train", "train", "train"),
     validation_scheme = val_scheme_str,
-    kernel_type        = kernel_type,
-    add_lon_lat        = addLonLat,
-    decorr_method      = decorr_method,
-    thin_dist_m        = thin_dist,
-    n_predictors       = length(predictors_list),
-    remove_outliers    = remove_outliers
+    kernel_type       = kernel_type,
+    add_lon_lat       = addLonLat,
+    decorr_method     = decorr_method,
+    thin_dist_m       = thin_dist,
+    n_predictors      = length(predictors_list),
+    remove_outliers   = remove_outliers
   )
   
   suffix <- paste0("_", kernel_type, "_", val_scheme_str, "_", toupper(decorr_method),
@@ -448,45 +495,62 @@ svr_ho_pipeline <- function(outdir,
     p_train + p_test, width = 12, height = 5.5, dpi = 600
   )
   
-  
   # ------------------------------------------------------------------------------
-  # 6.1. EXPLAINABILITY WITH SHAP VALUES
+  # 6.1. EXPLAINABILITY WITH SHAP VALUES (fastshap + shapviz)
   # ------------------------------------------------------------------------------
   message("Calculating SHAP values for the SVR model...")
   
-  # 1. Define the predictive function adapted for fastshap
+  # Prediction wrapper for fastshap
   pfun <- function(object, newdata) {
-    predict(object, newdata = newdata)
+    as.numeric(predict(object, newdata = newdata))
   }
   
-  # 2. Calculate SHAP values
-  # Note: 'X' must contain only the predictor variables (excluding the response 'Ho')
+  # 'X' must contain only the predictors (no response 'Ho')
+  X_shap <- data_sel_model[, predictors_list, drop = FALSE]
+  
+  # parallel = FALSE: the cluster is already closed at this point, and a
+  # sequential foreach backend would emit one warning per call otherwise.
   set.seed(123)
   shap_values <- fastshap::explain(
     final_svr,
-    X            = data_sel_model[, predictors_list, drop = FALSE],
+    X            = X_shap,
     pred_wrapper = pfun,
-    nsim         = 50,         # Number of Monte Carlo iterations (increase if higher precision is needed)
-    parallel     = TRUE        # Leverages processing cores if an active cluster is available
+    nsim         = 50,        # Monte Carlo repetitions (increase for more precision)
+    parallel     = FALSE
   )
   
-  # 3. Save detailed cell-level SHAP values
+  # Cell-level SHAP values
   shap_df <- as.data.frame(shap_values)
-  shap_df$cell_row <- 1:nrow(shap_df)
-  
+  shap_df$cell_row <- seq_len(nrow(shap_df))
   write.csv(
     shap_df,
     file.path(outdir, paste0(sp_name, "_SHAP_Values_CELLS", suffix, ".csv")),
     row.names = FALSE
   )
   
-  # 4. Global Importance Plot (Mean of absolute SHAP values)
-  p_shap_imp <- ggplot2::autoplot(shap_values, type = "importance") +
+  # Mean |SHAP| per predictor
+  shap_imp <- sort(colMeans(abs(as.matrix(shap_values))), decreasing = TRUE)
+  write.csv(
+    data.frame(predictor = names(shap_imp), mean_abs_shap = as.numeric(shap_imp)),
+    file.path(outdir, paste0(sp_name, "_SHAP_Importance", suffix, ".csv")),
+    row.names = FALSE
+  )
+  
+  # shapviz object (baseline = mean prediction used by fastshap)
+  # fastshap stores NA (not NULL) when adjust = FALSE; fall back to the mean
+  # prediction over X, which is the reference value of the Shapley decomposition
+  shap_baseline <- attr(shap_values, "baseline")
+  if (is.null(shap_baseline) || length(shap_baseline) != 1L || !is.finite(shap_baseline)) {
+    shap_baseline <- mean(pfun(final_svr, X_shap), na.rm = TRUE)
+  }
+  sv <- shapviz::shapviz(as.matrix(shap_values), X = X_shap, baseline = shap_baseline)
+  
+  # A) Global importance (bar)
+  p_shap_imp <- shapviz::sv_importance(sv, kind = "bar", max_display = Inf) +
     labs(
       title    = "A) Global Importance (SHAP)",
       subtitle = paste("SVR Model |", val_scheme_str),
-      x        = "Mean Absolute SHAP Value (Impact on Ho)",
-      y        = "Predictor"
+      x        = "Mean Absolute SHAP Value (Impact on Ho)"
     ) +
     theme_bw(13)
   
@@ -495,12 +559,33 @@ svr_ho_pipeline <- function(outdir,
     p_shap_imp, width = 7, height = 6, dpi = 600
   )
   
-  # 5. Dependence / Global Effect Plot (Example for the most important or a specific variable)
-  # Shows how the value of the climatic variable affects the Ho prediction
-  # top_var <- names(sort(colMeans(abs(shap_values)), decreasing = TRUE))[1]
-  # p_dep <- fastshap::autoplot(shap_values, type = "dependence", feature = top_var, X = data_sel_model) +
-  #   theme_bw(13)
-  # ggsave(file.path(outdir, paste0(sp_name, "_SHAP_Dependence_", top_var, suffix, ".png")), p_dep, width = 6, height = 5, dpi = 300)
+  # B) Beeswarm (needs the 'ggbeeswarm' package)
+  if (requireNamespace("ggbeeswarm", quietly = TRUE)) {
+    p_shap_bee <- shapviz::sv_importance(sv, kind = "beeswarm", max_display = Inf) +
+      labs(
+        title    = "B) SHAP Beeswarm",
+        subtitle = paste("SVR Model |", val_scheme_str)
+      ) +
+      theme_bw(13)
+    
+    ggsave(
+      file.path(outdir, paste0(sp_name, "_SHAP_Beeswarm", suffix, ".png")),
+      p_shap_bee, width = 8, height = 6, dpi = 600
+    )
+  } else {
+    message("Package 'ggbeeswarm' not installed: beeswarm plot skipped.")
+  }
+  
+  # C) Dependence plot for the most important predictor
+  top_var <- names(shap_imp)[1]
+  p_dep <- shapviz::sv_dependence(sv, v = top_var) +
+    labs(title = paste("C) SHAP Dependence:", top_var)) +
+    theme_bw(13)
+  
+  ggsave(
+    file.path(outdir, paste0(sp_name, "_SHAP_Dependence_", top_var, suffix, ".png")),
+    p_dep, width = 6.5, height = 5, dpi = 600
+  )
   
   # ------------------------------------------------------------------------------
   # 7. SPATIAL PREDICTION (RASTER)
@@ -584,7 +669,7 @@ svr_ho_pipeline <- function(outdir,
     tm_layout(inner.margins = 0, legend.outside = TRUE, legend.outside.position = "right")
   
   tmap::tmap_save(
-    tm        = map_out,
+    tm       = map_out,
     filename = file.path(outdir, paste0(sp_name, "_Ho_Map_SVM_CELLS_RAW", suffix, ".pdf")),
     width = 25, height = 15, units = "cm", dpi = 600
   )
@@ -604,7 +689,7 @@ svr_ho_pipeline <- function(outdir,
     tm_layout(inner.margins = 0, legend.outside = TRUE, legend.outside.position = "right")
   
   tmap::tmap_save(
-    tm        = map_out,
+    tm       = map_out,
     filename = file.path(outdir, paste0(sp_name, "_Ho_Map_SVM_CELLS", suffix, ".pdf")),
     width = 25, height = 15, units = "cm", dpi = 600
   )
@@ -617,15 +702,16 @@ svr_ho_pipeline <- function(outdir,
 }
 
 # ==============================================================================
-# CONFIGURACIÓN GENERAL DE RUTAS Y PARÁMETROS
+# GENERAL PATHS AND PARAMETERS
 # ==============================================================================
-n_cores         <- 6L
+n_cores         <- 6L          # fixed number of cores; edit here if needed
 decorr_method   <- "vif"
 vif_th          <- 10
 cor_cutoff      <- 0.5
+dom_max         <- 0.3
 remove_outliers <- TRUE
 iqr_mult        <- 1.5
-thin_dist       <- 5000   
+thin_dist       <- 5000
 
 out_dir  <- "D:/PROGRAMAS/Dropbox/TESIS_JORGE/test_macrogenetics"
 r_dir    <- "D:/test_layers_30s"
@@ -647,11 +733,10 @@ cv_configs <- list(
 )
 
 # ==============================================================================
-# GRILLA DE ESCENARIOS
+# SCENARIO GRID
 # ==============================================================================
 scenarios_grid <- expand.grid(
-  sp_code         =  #c("CA",
-                      c("CM"),
+  sp_code          = c("CM"),   # c("CA", "CM")
   addLonLat        = c(TRUE, FALSE),
   cv_type          = c("LOOCV", "BLOCKCV"),
   thin_dist        = c(15000),
@@ -659,15 +744,14 @@ scenarios_grid <- expand.grid(
 )
 
 scenarios_grid <- scenarios_grid[-c(5, 7), ]
-cat("Total de escenarios a ejecutar:", nrow(scenarios_grid), "\n")
+cat("Total scenarios to run:", nrow(scenarios_grid), "\n")
 
 # ==============================================================================
-# EJECUCIÓN AUTOMATIZADA
+# AUTOMATED EXECUTION
 # ==============================================================================
 results <- list()
 
 for (i in 1:nrow(scenarios_grid)) {
-# i <- 2  
   row     <- scenarios_grid[i, ]
   sp_data <- species_info[[row$sp_code]]
   cv_data <- cv_configs[[row$cv_type]]
@@ -681,7 +765,7 @@ for (i in 1:nrow(scenarios_grid)) {
   outdir_path <- file.path(out_dir, folder_name)
   
   cat(sprintf("\n------------------------------------------------------------\n"))
-  cat(sprintf("[%d/%d] Ejecutando: %s\n", i, nrow(scenarios_grid), folder_name))
+  cat(sprintf("[%d/%d] Running: %s\n", i, nrow(scenarios_grid), folder_name))
   cat(sprintf("------------------------------------------------------------\n"))
   
   results[[folder_name]] <- svr_ho_pipeline(
@@ -694,6 +778,7 @@ for (i in 1:nrow(scenarios_grid)) {
     decorr_method   = decorr_method,
     vif_th          = vif_th,
     cor_cutoff      = cor_cutoff,
+    dom_max         = dom_max,
     addLonLat       = row$addLonLat,
     use_blockcv     = cv_data$use_blockcv,
     use_loocv       = cv_data$use_loocv,
@@ -706,17 +791,17 @@ for (i in 1:nrow(scenarios_grid)) {
   terra::tmpFiles(current = TRUE, orphan = TRUE, old = TRUE, remove = TRUE)
 }
 
-cat("\n¡Procesamiento finalizado exitosamente para todos los escenarios!\n")
+cat("\nAll scenarios finished successfully!\n")
 
 # ==============================================================================
-# CONSOLIDACIÓN DE MÉTRICAS GLOBALES (TRAIN Y TESTING) DE TODOS LOS ESCENARIOS
+# CONSOLIDATED METRICS (TRAIN AND TEST) ACROSS ALL SCENARIOS
 # ==============================================================================
-cat("\nConsolidando métricas de todos los escenarios...\n")
+cat("\nConsolidating metrics from all scenarios...\n")
 
 metrics_files <- list.files(
-  path       = out_dir, 
-  pattern    = "_SVM_Metrics_CELLS.*\\.csv$", 
-  recursive  = TRUE, 
+  path       = out_dir,
+  pattern    = "_SVM_Metrics_CELLS.*\\.csv$",
+  recursive  = TRUE,
   full.names = TRUE
 )
 
@@ -730,7 +815,7 @@ if (length(metrics_files) > 0) {
   consolidated_output_path <- file.path(out_dir, "Consolidated_SVM_Metrics_All_Scenarios.csv")
   write.csv(all_metrics, consolidated_output_path, row.names = FALSE)
   
-  cat(sprintf("¡Consolidación exitosa! Archivo guardado en:\n%s\n", consolidated_output_path))
+  cat(sprintf("Consolidation successful! File saved to:\n%s\n", consolidated_output_path))
 } else {
-  warning("No se encontraron archivos de métricas para consolidar.")
+  warning("No metrics files found to consolidate.")
 }
